@@ -1,14 +1,21 @@
 name: Build cargo-tauri for Termux
 
-# 编译在 Termux (android/arm64) 上可直接运行的 tauri-cli。
+# 编译可在 Termux (Android / arm64) 直接运行的 tauri-cli。
 #
 # 背景：npm 上的 @tauri-apps/cli 只发布 linux/macos/windows 宿主原生绑定，
 # 根本没有 @tauri-apps/cli-android-arm64，所以 Termux 无法使用 npm 版 CLI。
 #
-# 做法：在 x86_64 runner 上，用 Android NDK 交叉编译出 aarch64-linux-android
-# 的 tauri-cli。NDK 产物链接 bionic（与 Termux 相同），可在 Termux 直接运行。
+# 为什么不直接编 aarch64-linux-android：tauri-bundler 里的 cfg 只认
+# linux / windows / macos，没有 android 分支，会直接编译失败：
+#   error[E0425]: cannot find value `bundle_type` in this scope
+#   error[E0425]: cannot find value `system_nsis_toolset_path` in this scope
 #
-# 产物：artifact `cargo-tauri-aarch64-linux-android-<version>`
+# 做法：走官方支持的宿主平台分支，编 aarch64-unknown-linux-musl。
+# 静态链接、无 PT_INTERP，Termux 可以直接运行（Termux 社区标准做法）。
+# tauri-cli 只是个命令行工具，实际编译/链接 Android 的工作由 Termux 原生
+# 的 cargo + NDK 完成，所以 musl / bionic 的差异在这里无所谓。
+#
+# 产物：artifact `cargo-tauri-aarch64-linux-musl-<version>`
 
 on:
   workflow_dispatch:
@@ -23,10 +30,6 @@ on:
 permissions:
   contents: read
 
-env:
-  NDK_VERSION: r27c
-  ANDROID_API: "24" # Termux 最低支持 Android 7 (API 24)
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -40,39 +43,15 @@ jobs:
           V="${{ github.event.inputs.version }}"
           echo "version=${V:-2.11.4}" >> "$GITHUB_OUTPUT"
 
-      - name: Install Rust with the Android target
+      - name: Install Rust with the musl target
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android
+          targets: aarch64-unknown-linux-musl
 
-      - name: Install Android NDK (${{ env.NDK_VERSION }})
-        id: ndk
-        uses: nttld/setup-ndk@v1
+      - name: Install cross
+        uses: taiki-e/install-action@v2
         with:
-          ndk-version: ${{ env.NDK_VERSION }}
-          add-to-path: false
-          local-cache: true
-
-      - name: Point the Rust linker at the NDK
-        run: |
-          set -euo pipefail
-          TOOLCHAIN="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          CC="$TOOLCHAIN/aarch64-linux-android${ANDROID_API}-clang"
-          CXX="$TOOLCHAIN/aarch64-linux-android${ANDROID_API}-clang++"
-          test -x "$CC" || { echo "missing $CC"; exit 1; }
-          {
-            echo "NDK_TOOLCHAIN_BIN=$TOOLCHAIN"
-            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$CC"
-            echo "CC_aarch64-linux-android=$CC"
-            echo "CC_aarch64_linux_android=$CC"
-            echo "CXX_aarch64-linux-android=$CXX"
-            echo "CXX_aarch64_linux_android=$CXX"
-            echo "AR_aarch64-linux-android=$TOOLCHAIN/llvm-ar"
-            echo "AR_aarch64_linux_android=$TOOLCHAIN/llvm-ar"
-            echo "RANLIB_aarch64-linux-android=$TOOLCHAIN/llvm-ranlib"
-            echo "RANLIB_aarch64_linux_android=$TOOLCHAIN/llvm-ranlib"
-          } >> "$GITHUB_ENV"
-          echo "linker -> $CC"
+          tool: cross
 
       - name: Checkout tauri at the matching tag
         run: |
@@ -85,38 +64,64 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: tauri
-          key: android-${{ steps.v.outputs.version }}
+          key: musl-${{ steps.v.outputs.version }}
 
-      - name: Free disk / show space
+      - name: Show disk space
         run: df -h /
 
-      - name: Build tauri-cli
+      - name: Build tauri-cli (static musl)
         working-directory: tauri
         run: |
           set -euo pipefail
-          cargo build --release --locked -p tauri-cli --target aarch64-linux-android
-          ls -la target/aarch64-linux-android/release/cargo-tauri
+          cross build --release --locked -p tauri-cli \
+            --target aarch64-unknown-linux-musl
+          ls -la target/aarch64-unknown-linux-musl/release/cargo-tauri
 
       - name: Strip
         working-directory: tauri
         run: |
           set -euo pipefail
-          BIN=target/aarch64-linux-android/release/cargo-tauri
-          "$NDK_TOOLCHAIN_BIN/llvm-strip" --strip-all "$BIN"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq binutils-aarch64-linux-gnu
+          BIN=target/aarch64-unknown-linux-musl/release/cargo-tauri
+          aarch64-linux-gnu-strip --strip-all "$BIN"
           ls -la "$BIN"
 
-      - name: Inspect
+      - name: Verify static ARM64 binary
         working-directory: tauri
+        shell: bash
         run: |
           set -euo pipefail
-          BIN=target/aarch64-linux-android/release/cargo-tauri
-          "$NDK_TOOLCHAIN_BIN/llvm-readelf" -h "$BIN" | grep -E 'Class|Machine'
-          "$NDK_TOOLCHAIN_BIN/llvm-readelf" -d "$BIN" | grep -i 'NEEDED' || true
+
+          BIN=target/aarch64-unknown-linux-musl/release/cargo-tauri
+
+          file "$BIN"
+
+          readelf -h "$BIN" > /tmp/elfhdr.txt
+          readelf -l "$BIN" > /tmp/elfphdr.txt
+          grep -E 'Class:|Machine:' /tmp/elfhdr.txt
+
+          grep -q 'Class:.*ELF64'     /tmp/elfhdr.txt || { echo "ERROR: not ELF64";    exit 1; }
+          grep -q 'Machine:.*AArch64' /tmp/elfhdr.txt || { echo "ERROR: not AArch64"; exit 1; }
+
+          if grep -q 'INTERP' /tmp/elfphdr.txt; then
+            echo "ERROR: PT_INTERP found -> dynamic binary"
+            exit 1
+          fi
+          echo "OK: no PT_INTERP (statically linked)"
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user-static
+
+          # qemu-user-static 只提供 qemu-aarch64-static；不带后缀的 qemu-aarch64 属于 qemu-user 包
+          QEMU="$(command -v qemu-aarch64-static || command -v qemu-aarch64)"
+          echo "using $QEMU"
+          "$QEMU" "$BIN" --version
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cargo-tauri-aarch64-linux-android-${{ steps.v.outputs.version }}
-          path: tauri/target/aarch64-linux-android/release/cargo-tauri
+          name: cargo-tauri-aarch64-linux-musl-${{ steps.v.outputs.version }}
+          path: tauri/target/aarch64-unknown-linux-musl/release/cargo-tauri
           if-no-files-found: error
           retention-days: 30
