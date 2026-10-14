@@ -49,6 +49,9 @@ jobs:
     timeout-minutes: 120
 
     steps:
+      - name: Checkout this repository (for patches/)
+        uses: actions/checkout@v4
+
       - name: Resolve version
         id: v
         run: |
