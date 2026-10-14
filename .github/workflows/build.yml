@@ -1,0 +1,122 @@
+name: Build cargo-tauri for Termux
+
+# 编译在 Termux (android/arm64) 上可直接运行的 tauri-cli。
+#
+# 背景：npm 上的 @tauri-apps/cli 只发布 linux/macos/windows 宿主原生绑定，
+# 根本没有 @tauri-apps/cli-android-arm64，所以 Termux 无法使用 npm 版 CLI。
+#
+# 做法：在 x86_64 runner 上，用 Android NDK 交叉编译出 aarch64-linux-android
+# 的 tauri-cli。NDK 产物链接 bionic（与 Termux 相同），可在 Termux 直接运行。
+#
+# 产物：artifact `cargo-tauri-aarch64-linux-android-<version>`
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "tauri-cli version (must match the npm @tauri-apps/cli version)"
+        required: true
+        default: "2.11.4"
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  NDK_VERSION: r27c
+  ANDROID_API: "24" # Termux 最低支持 Android 7 (API 24)
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Resolve version
+        id: v
+        run: |
+          set -euo pipefail
+          V="${{ github.event.inputs.version }}"
+          echo "version=${V:-2.11.4}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust with the Android target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install Android NDK (${{ env.NDK_VERSION }})
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: false
+          local-cache: true
+
+      - name: Point the Rust linker at the NDK
+        run: |
+          set -euo pipefail
+          TOOLCHAIN="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CC="$TOOLCHAIN/aarch64-linux-android${ANDROID_API}-clang"
+          CXX="$TOOLCHAIN/aarch64-linux-android${ANDROID_API}-clang++"
+          test -x "$CC" || { echo "missing $CC"; exit 1; }
+          {
+            echo "NDK_TOOLCHAIN_BIN=$TOOLCHAIN"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$CC"
+            echo "CC_aarch64-linux-android=$CC"
+            echo "CC_aarch64_linux_android=$CC"
+            echo "CXX_aarch64-linux-android=$CXX"
+            echo "CXX_aarch64_linux_android=$CXX"
+            echo "AR_aarch64-linux-android=$TOOLCHAIN/llvm-ar"
+            echo "AR_aarch64_linux_android=$TOOLCHAIN/llvm-ar"
+            echo "RANLIB_aarch64-linux-android=$TOOLCHAIN/llvm-ranlib"
+            echo "RANLIB_aarch64_linux_android=$TOOLCHAIN/llvm-ranlib"
+          } >> "$GITHUB_ENV"
+          echo "linker -> $CC"
+
+      - name: Checkout tauri at the matching tag
+        run: |
+          set -euo pipefail
+          git clone --depth 1 \
+            --branch "tauri-cli-v${{ steps.v.outputs.version }}" \
+            https://github.com/tauri-apps/tauri.git tauri
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tauri
+          key: android-${{ steps.v.outputs.version }}
+
+      - name: Free disk / show space
+        run: df -h /
+
+      - name: Build tauri-cli
+        working-directory: tauri
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p tauri-cli --target aarch64-linux-android
+          ls -la target/aarch64-linux-android/release/cargo-tauri
+
+      - name: Strip
+        working-directory: tauri
+        run: |
+          set -euo pipefail
+          BIN=target/aarch64-linux-android/release/cargo-tauri
+          "$NDK_TOOLCHAIN_BIN/llvm-strip" --strip-all "$BIN"
+          ls -la "$BIN"
+
+      - name: Inspect
+        working-directory: tauri
+        run: |
+          set -euo pipefail
+          BIN=target/aarch64-linux-android/release/cargo-tauri
+          "$NDK_TOOLCHAIN_BIN/llvm-readelf" -h "$BIN" | grep -E 'Class|Machine'
+          "$NDK_TOOLCHAIN_BIN/llvm-readelf" -d "$BIN" | grep -i 'NEEDED' || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-tauri-aarch64-linux-android-${{ steps.v.outputs.version }}
+          path: tauri/target/aarch64-linux-android/release/cargo-tauri
+          if-no-files-found: error
+          retention-days: 30
