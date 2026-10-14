@@ -5,15 +5,28 @@ name: Build cargo-tauri for Termux
 # 背景：npm 上的 @tauri-apps/cli 只发布 linux/macos/windows 宿主原生绑定，
 # 根本没有 @tauri-apps/cli-android-arm64，所以 Termux 无法使用 npm 版 CLI。
 #
-# 为什么不直接编 aarch64-linux-android：tauri-bundler 里的 cfg 只认
-# linux / windows / macos，没有 android 分支，会直接编译失败：
-#   error[E0425]: cannot find value `bundle_type` in this scope
-#   error[E0425]: cannot find value `system_nsis_toolset_path` in this scope
+# 两处 Termux 适配：
 #
-# 做法：走官方支持的宿主平台分支，编 aarch64-unknown-linux-musl。
-# 静态链接、无 PT_INTERP，Termux 可以直接运行（Termux 社区标准做法）。
-# tauri-cli 只是个命令行工具，实际编译/链接 Android 的工作由 Termux 原生
-# 的 cargo + NDK 完成，所以 musl / bionic 的差异在这里无所谓。
+# 1) 目标三元组用 aarch64-unknown-linux-musl 而不是 aarch64-linux-android。
+#    aarch64-linux-android 编不过，原因有两层：
+#      - crates/tauri-cli/src/lib.rs 第一行就是
+#          #![cfg(any(target_os = "macos", target_os = "linux", windows))]
+#        整个 lib 在 android target 下是空的，android 构建能力直接消失；
+#      - tauri-bundler 里的 cfg 只认 linux/windows/macos，没有 android 分支，
+#        会报 error[E0425]: cannot find value `bundle_type` / `system_nsis_toolset_path`。
+#    改用 musl：静态链接、无 PT_INTERP，Termux 能直接运行。tauri-cli 只是命令行
+#    工具，真正编译/链接 Android 的工作由 Termux 原生 cargo + NDK 完成，
+#    musl / bionic 的差异在这里无所谓。
+#
+# 2) 给 cargo-mobile2 打补丁，让它用 `sh gradlew` 调用 Gradle wrapper。
+#    cargo-mobile2 是直接 exec `<project>/gradlew` 的，而 Tauri 生成的 wrapper
+#    首行是 `#!/usr/bin/env sh`。Termux 上没有 /usr，且 musl 静态二进制无法借助
+#    termux-exec 重写 shebang（LD_PRELOAD 对静态可执行文件不生效），于是内核
+#    execve 直接返回 ENOENT，表现为：
+#      Error `gradlew` not found. Make sure you have the Android SDK installed
+#    见 patches/cargo-mobile2-0.22.4-run-gradlew-via-sh.patch。
+#    修在 CLI 里而不是改项目里的 gradlew，这样所有 Tauri Android 项目在 Termux
+#    上都不必再动仓库文件。
 #
 # 产物：artifact `cargo-tauri-aarch64-linux-musl-<version>`
 
@@ -60,6 +73,41 @@ jobs:
             --branch "tauri-cli-v${{ steps.v.outputs.version }}" \
             https://github.com/tauri-apps/tauri.git tauri
 
+      - name: Patch cargo-mobile2 to run gradlew via sh
+        working-directory: tauri
+        env:
+          CM2: "0.22.4"
+        run: |
+          set -euo pipefail
+
+          curl -sSL --retry 3 \
+            "https://crates.io/api/v1/crates/cargo-mobile2/${CM2}/download" \
+            -o cargo-mobile2.crate
+          mkdir -p vendor
+          tar xzf cargo-mobile2.crate -C vendor
+          rm -f cargo-mobile2.crate
+          mv "vendor/cargo-mobile2-${CM2}" vendor/cargo-mobile2
+          rm -f vendor/cargo-mobile2/Cargo.lock
+
+          patch -p1 -d vendor/cargo-mobile2 \
+            < "$GITHUB_WORKSPACE/patches/cargo-mobile2-${CM2}-run-gradlew-via-sh.patch"
+
+          # 让被 patch 的 crate 自成一个 workspace，否则 cargo 会认为它属于
+          # tauri workspace 但不在 members 里而报错
+          printf '\n[workspace]\n' >> vendor/cargo-mobile2/Cargo.toml
+
+          # 复用 tauri 根 Cargo.toml 里已存在的 [patch.crates-io] 表
+          # （里面已有 schemars_derive / tauri / tauri-plugin / tauri-utils）
+          sed -i \
+            '/^\[patch\.crates-io\]/a cargo-mobile2 = { path = "./vendor/cargo-mobile2" }' \
+            Cargo.toml
+
+          echo "--- Cargo.toml [patch.crates-io] ---"
+          sed -n '/^\[patch\.crates-io\]/,/^\[/p' Cargo.toml
+
+          echo "--- patched call site ---"
+          grep -n -A14 'if gradlew_p.exists()' vendor/cargo-mobile2/src/util/mod.rs
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
@@ -73,9 +121,33 @@ jobs:
         working-directory: tauri
         run: |
           set -euo pipefail
-          cross build --release --locked -p tauri-cli \
+
+          # 故意不加 --locked：vendored cargo-mobile2 会让 cargo 重写该 crate
+          # 在 lockfile 里的来源条目
+          cross build --release -p tauri-cli \
             --target aarch64-unknown-linux-musl
-          ls -la target/aarch64-unknown-linux-musl/release/cargo-tauri
+
+          BIN=target/aarch64-unknown-linux-musl/release/cargo-tauri
+          ls -la "$BIN"
+
+          # 确认补丁真的生效了：cargo-mobile2 必须变成 path 依赖，
+          # 否则说明 cargo 忽略了 [patch]，打出来的 CLI 还是坏的
+          python3 <<'PY'
+          import sys
+
+          lock = open("Cargo.lock", encoding="utf-8").read()
+          for block in lock.split("[[package]]"):
+              if 'name = "cargo-mobile2"' in block:
+                  if "source = " in block:
+                      sys.exit(
+                          "ERROR: cargo-mobile2 was NOT patched "
+                          "(still a registry source in Cargo.lock)"
+                      )
+                  print("OK: cargo-mobile2 is a path dependency (patch applied)")
+                  break
+          else:
+              sys.exit("ERROR: cargo-mobile2 missing from Cargo.lock")
+          PY
 
       - name: Strip
         working-directory: tauri

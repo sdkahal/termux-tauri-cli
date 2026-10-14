@@ -1,0 +1,31 @@
+--- a/src/util/mod.rs
++++ b/src/util/mod.rs
+@@ -656,12 +656,22 @@
+     let project_dir = dunce::simplified(&project_dir);
+     let gradlew_p = project_dir.join(gradlew);
+     if gradlew_p.exists() {
+-        duct::cmd(
+-            gradlew_p,
+-            [OsStr::new("--project-dir"), project_dir.as_ref()],
+-        )
+-        .vars(env.explicit_env())
+-        .dup_stdio()
++        // Android/Termux: the generated `gradlew` wrapper starts with
++        // `#!/usr/bin/env sh`. Termux has no `/usr` and a statically linked
++        // binary cannot rely on termux-exec to rewrite the shebang, so a direct
++        // execve of the wrapper fails with ENOENT. Run it through `sh` instead.
++        let sh_bin = std::env::var_os("PREFIX")
++            .map(std::path::PathBuf::from)
++            .map(|p| p.join("bin").join("sh"))
++            .filter(|p| p.exists())
++            .unwrap_or_else(|| std::path::PathBuf::from("sh"));
++        let mut gradlew_args: Vec<std::ffi::OsString> = Vec::new();
++        gradlew_args.push(gradlew_p.into_os_string());
++        gradlew_args.push(std::ffi::OsString::from("--project-dir"));
++        gradlew_args.push(project_dir.as_os_str().to_os_string());
++        duct::cmd(sh_bin, gradlew_args)
++            .vars(env.explicit_env())
++            .dup_stdio()
+     } else if duct::cmd(gradlew, ["-v"])
+         .dup_stdio()
+         .run()
